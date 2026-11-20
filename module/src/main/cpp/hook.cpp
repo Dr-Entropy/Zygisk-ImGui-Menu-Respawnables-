@@ -1,4 +1,5 @@
 #include <cstring>
+#include <strings.h>
 #include <cstdio>
 #include <unistd.h>
 #include <sys/system_properties.h>
@@ -31,7 +32,7 @@
 #include "Rect.h"
 #include <fstream>
 #include <limits>
-#define GamePackageName "com.kakaogames.gdts" // define the game package name here please
+#define GamePackageName "respawn" // case-insensitive part of the game package name (check: pm list packages | grep -i respawn)
 
 int glHeight, glWidth;
 
@@ -49,7 +50,7 @@ int isGame(JNIEnv *env, jstring appDataDir)
             return 0;
         }
     }
-    if (strcmp(package_name, GamePackageName) == 0) {
+    if (strcasestr(package_name, GamePackageName) != nullptr) {
         LOGI(OBFUSCATE("detect game: %s"), package_name);
         game_data_dir = new char[strlen(app_data_dir) + 1];
         strcpy(game_data_dir, app_data_dir);
@@ -82,15 +83,13 @@ HOOKAF(int32_t, Consume, void *thiz, void *arg1, bool arg2, long arg3, uint32_t 
 #include "menu.h"
 
 void *hack_thread(void *arg) {
+    // Not Unity-specific: hook the system EGL swap, wait until the game has started rendering
+    void *eglSwapBuffers = nullptr;
     do {
-        sleep(1);
-        g_il2cppBaseMap = KittyMemory::getLibraryBaseMap("libil2cpp.so");
-    } while (!g_il2cppBaseMap.isValid());
-    KITTY_LOGI("il2cpp base: %p", (void*)(g_il2cppBaseMap.startAddress));
-    Pointers();
-    Hooks();
-    auto eglhandle = dlopen("libunity.so", RTLD_LAZY);
-    auto eglSwapBuffers = dlsym(eglhandle, "eglSwapBuffers");
+        sleep(3);
+        void *eglhandle = dlopen("libEGL.so", RTLD_NOW);
+        if (eglhandle) eglSwapBuffers = dlsym(eglhandle, "eglSwapBuffers");
+    } while (!eglSwapBuffers);
     DobbyHook((void*)eglSwapBuffers,(void*)hook_eglSwapBuffers,
               (void**)&old_eglSwapBuffers);
     void *sym_input = DobbySymbolResolver(("/system/lib/libinput.so"), ("_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE"));

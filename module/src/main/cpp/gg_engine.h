@@ -231,6 +231,21 @@ public:
 private:
     int fd_ = -1;
     std::mutex mu_;
+    std::vector<uint8_t> scanbuf_;
+    std::vector<std::pair<uintptr_t, size_t>> self_; // our own heap objects (sorted): never treat as hits
+
+    void addSelf(const void *p, size_t n) { if (p && n) self_.push_back({(uintptr_t)p, n}); }
+    void addSelfStr(const std::string &s) { addSelf(s.data(), s.capacity() + 1); }
+    bool isSelf(uintptr_t a, size_t n) const {
+        auto it = std::upper_bound(self_.begin(), self_.end(), std::make_pair(a + n, (size_t)0),
+                                   [](const std::pair<uintptr_t, size_t> &x, const std::pair<uintptr_t, size_t> &y) { return x.first < y.first; });
+        while (it != self_.begin()) {
+            --it;
+            if (it->first + it->second <= a) { if (it->first + 65536 < a) break; continue; }
+            return true;
+        }
+        return false;
+    }
     std::vector<std::string> log_;
     std::vector<std::pair<int, std::vector<Undo>>> undo_;
 
@@ -249,6 +264,25 @@ private:
         std::vector<std::string> sv = split(op.search, ';');
         std::vector<Needle> needles;
         for (auto &s : sv) needles.push_back(makeNeedle(op.type, s));
+        std::vector<std::string> ev = split(op.edit, ';');
+        {   // register everything we own that contains the values being searched
+            self_.clear();
+            const size_t CH = 1 << 20;
+            size_t maxLen = 1;
+            for (auto &n : needles) maxLen = std::max(maxLen, n.size());
+            scanbuf_.assign(CH + maxLen, 0);
+            addSelf(scanbuf_.data(), scanbuf_.size());
+            addSelf(sv.data(), sv.capacity() * sizeof(std::string));
+            addSelf(ev.data(), ev.capacity() * sizeof(std::string));
+            addSelf(needles.data(), needles.capacity() * sizeof(Needle));
+            for (auto &x : sv) addSelfStr(x);
+            for (auto &x : ev) addSelfStr(x);
+            for (auto &n : needles) addSelfStr(n.text);
+            for (auto &u : undo) addSelf(u.old.data(), u.old.capacity());
+            std::lock_guard<std::mutex> g(mu_);
+            for (auto &slot : undo_) for (auto &u : slot.second) addSelf(u.old.data(), u.old.capacity());
+            std::sort(self_.begin(), self_.end());
+        }
         bool group = needles.size() > 1;
         size_t limit = op.maxResults > 0 ? (size_t)op.maxResults : 0;
 
@@ -265,13 +299,13 @@ private:
         if (group) hits = groupFilter(hits, needles.size());
         if (limit && hits.size() > limit) hits.resize(limit);
 
-        std::vector<std::string> ev = split(op.edit, ';');
         size_t written = 0;
         for (auto &h : hits) {
             if (ev.empty() || ev[0].empty()) break; // search-only
             const std::string &val = ev.size() == needles.size() ? ev[h.idx] : ev[0];
             if (writeValue(op.editType, val, h.addr, undo)) written++;
         }
+        scanbuf_.clear(); scanbuf_.shrink_to_fit();
         return hits.size();
     }
 
@@ -280,7 +314,7 @@ private:
         size_t maxLen = 0, align = 1;
         for (auto &n : needles) maxLen = std::max(maxLen, n.size());
         if (needles[0].type != BYTE) align = needles[0].size();
-        std::vector<uint8_t> buf(CH + maxLen);
+        std::vector<uint8_t> &buf = scanbuf_;
         for (uintptr_t a = m.start; a < m.end && !cancel; a += CH) {
             size_t want = std::min<uintptr_t>(CH + maxLen - 1, m.end - a);
             ssize_t got = pread(fd_, buf.data(), want, (off_t)a);
@@ -292,6 +326,7 @@ private:
                 for (size_t k = 0; k < needles.size(); k++) {
                     const Needle &n = needles[k];
                     if (o + n.size() <= (size_t)got && matchAt(n, buf.data() + o)) {
+                        if (isSelf(a + o, n.size())) break; // our own copy, not game memory
                         hits.push_back({a + o, (int)k});
                         if (cap && hits.size() >= cap) return;
                         break;

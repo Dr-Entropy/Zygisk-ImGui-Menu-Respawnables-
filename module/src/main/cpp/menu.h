@@ -1,41 +1,49 @@
-//
-// Created by lbert on 4/15/2023.
-//
-
+// menu.h - Respawnables menu (ImGui) driving the GG-style memory engine
 #ifndef ZYGISK_MENU_TEMPLATE_MENU_H
 #define ZYGISK_MENU_TEMPLATE_MENU_H
 
+#include "gg_engine.h"
+#include "gg_features.h"
+
 using namespace ImGui;
+
+static gg::Engine g_engine;
+static std::vector<gg::Feature> g_features = BuildFeatures();
+
+static const char *kTabs[] = {"Combat", "Spawns", "Time", "Shop", "XP"};
 
 void DrawMenu()
 {
-    static ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
-    {
-        Begin(OBFUSCATE("ZyCheats"));
-        ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_FittingPolicyResizeDown;
-        if (BeginTabBar("Menu", tab_bar_flags)) {
-            if (BeginTabItem(OBFUSCATE("Account"))) {
-                // here menu stuff, remove test btw
-                // ImGui::Checkbox(OBFUSCATE("This is a checkbox"), &test);
-                if (Button(OBFUSCATE("Add Currency"))) {
-                    // code for button action
-                    addCurrency = true;
-                }
-                TextUnformatted(OBFUSCATE("Adds 1000 gems"));
-                if (Button(OBFUSCATE("Add Skins"))) {
-                    // code for button action
-                    addSkins = true;
-                }
-                Checkbox(OBFUSCATE("Everything unlocked"), &everythingUnlocked);
-                Checkbox(OBFUSCATE("Free Items"), &freeItems);
-                Checkbox(OBFUSCATE("Show Items"), &showAllItems);
-                EndTabItem();
-            }
-            EndTabBar();
-        }
-        Patches();
-        End();
+    Begin(OBFUSCATE("Respawnables"));
+    if (g_engine.busy) {
+        ProgressBar(g_engine.progress, ImVec2(-1, 0), "Working...");
+        if (Button("Cancel")) g_engine.cancel = true;
     }
+    if (BeginTabBar("Tabs", ImGuiTabBarFlags_FittingPolicyResizeDown)) {
+        for (const char *tab : kTabs) {
+            if (!BeginTabItem(tab)) continue;
+            for (auto &f : g_features) {
+                if (strcmp(f.category, tab) != 0) continue;
+                PushID(f.id);
+                TextUnformatted(f.name);
+                if (f.note[0]) TextDisabled("%s", f.note);
+                if (Button("Apply")) g_engine.runAsync(f);
+                if (g_engine.hasUndo(f.id)) {
+                    SameLine();
+                    if (Button("Undo")) g_engine.revertAsync(f.id);
+                }
+                Separator();
+                PopID();
+            }
+            EndTabItem();
+        }
+        if (BeginTabItem("Log")) {
+            for (auto &l : g_engine.logLines()) TextWrapped("%s", l.c_str());
+            EndTabItem();
+        }
+        EndTabBar();
+    }
+    End();
 }
 
 void SetupImgui() {
@@ -49,14 +57,12 @@ void SetupImgui() {
     io.Fonts->AddFontFromMemoryTTF(Roboto_Regular, 30, 30.0f);
 }
 
-
 EGLBoolean (*old_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface);
 EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     eglQuerySurface(dpy, surface, EGL_WIDTH, &glWidth);
     eglQuerySurface(dpy, surface, EGL_HEIGHT, &glHeight);
 
-    if (!setupimg)
-    {
+    if (!setupimg) {
         SetupImgui();
         setupimg = true;
     }
