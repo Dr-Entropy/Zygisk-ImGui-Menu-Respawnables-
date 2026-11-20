@@ -160,11 +160,11 @@ public:
         if (fd_ < 0) { say("Cannot open /proc/self/mem (SELinux?)"); return; }
         if (f.flags == 1 || f.flags == 3) { say(std::string(f.name) + ": " + f.note); return; }
         if (f.flags == 2) { say(std::string(f.name) + ": original script does nothing here"); return; }
-        size_t total = 0;
+        size_t total = 0, wrote = 0;
         std::vector<Undo> undo;
         for (size_t i = 0; i < f.ops.size() && !cancel; i++) {
             progress = (float)i / (float)f.ops.size();
-            size_t n = runOp(f.ops[i], undo);
+            size_t n = runOp(f.ops[i], undo, &wrote);
             total += n;
             if (n == 0 && f.flags == 4) { say(std::string(f.name) + ": no value found (not in a match?)"); break; }
         }
@@ -175,7 +175,7 @@ public:
         }
         progress = 1.f;
         char b[160];
-        snprintf(b, sizeof b, "%s: %zu value(s) edited", f.name, total);
+        snprintf(b, sizeof b, "%s: found %zu, edited %zu", f.name, total, wrote);
         say(b);
     }
 
@@ -260,7 +260,7 @@ private:
         if (log_.size() > 40) log_.erase(log_.begin());
     }
 
-    size_t runOp(const Op &op, std::vector<Undo> &undo) {
+    size_t runOp(const Op &op, std::vector<Undo> &undo, size_t *writtenOut = nullptr) {
         std::vector<std::string> sv = split(op.search, ';');
         std::vector<Needle> needles;
         for (auto &s : sv) needles.push_back(makeNeedle(op.type, s));
@@ -306,6 +306,7 @@ private:
             if (writeValue(op.editType, val, h.addr, undo)) written++;
         }
         scanbuf_.clear(); scanbuf_.shrink_to_fit();
+        if (writtenOut) *writtenOut += written;
         return hits.size();
     }
 

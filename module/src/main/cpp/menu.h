@@ -62,12 +62,25 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     eglQuerySurface(dpy, surface, EGL_WIDTH, &glWidth);
     eglQuerySurface(dpy, surface, EGL_HEIGHT, &glHeight);
 
+    if (glWidth <= 0 || glHeight <= 0)
+        return old_eglSwapBuffers(dpy, surface);
+
     if (!setupimg) {
         SetupImgui();
         setupimg = true;
     }
 
     ImGuiIO &io = GetIO();
+    // keep the size in sync every frame (match start, rotation, multi-window / DeX)
+    io.DisplaySize = ImVec2((float) glWidth, (float) glHeight);
+
+    // save the game's GL state so the menu never leaks into the game's rendering
+    GLint prevViewport[4];
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLint prevScissorBox[4];
+    glGetIntegerv(GL_SCISSOR_BOX, prevScissorBox);
+
     ImGui_ImplOpenGL3_NewFrame();
     NewFrame();
 
@@ -75,8 +88,14 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 
     EndFrame();
     Render();
-    glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+    glViewport(0, 0, glWidth, glHeight);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    // restore
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    glScissor(prevScissorBox[0], prevScissorBox[1], prevScissorBox[2], prevScissorBox[3]);
+    if (prevScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+
     return old_eglSwapBuffers(dpy, surface);
 }
 
