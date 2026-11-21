@@ -15,6 +15,11 @@
 #include <vector>
 #include <algorithm>
 
+// IMPORTANT: on armeabi-v7a/x86 off_t is 32-bit, so addresses above 0x7FFFFFFF turned negative and
+// every pread() failed ("found 0"). Always use the 64-bit variants with a zero-extended address.
+#define GG_PREAD(fd, buf, n, addr)  pread64((fd), (buf), (n), (off64_t)(uint64_t)(uintptr_t)(addr))
+#define GG_PWRITE(fd, buf, n, addr) pwrite64((fd), (buf), (n), (off64_t)(uint64_t)(uintptr_t)(addr))
+
 namespace gg {
 
 enum Type : int { DWORD = 0, QWORD = 1, FLOAT = 2, BYTE = 3 };            // BYTE with ':' prefix = text
@@ -52,8 +57,18 @@ struct Undo {
 struct Needle {
     int type = DWORD;
     bool range = false;
-    int64_t lo = 0, hi = 0;   // integers / range
-    float flo = 0, fhi = 0;   // floats
+    // Stored XOR-masked on purpose: otherwise the scanner finds (and edits!) its own needle in the heap.
+    static constexpr uint64_t MASK = 0x5A3C96E1B7D24F08ull;
+    uint64_t elo = MASK, ehi = MASK, eflo = MASK, efhi = MASK;
+    int64_t lo() const { return (int64_t)(elo ^ MASK); }
+    int64_t hi() const { return (int64_t)(ehi ^ MASK); }
+    float flo() const { uint32_t u = (uint32_t)(eflo ^ MASK); float f; memcpy(&f, &u, 4); return f; }
+    float fhi() const { uint32_t u = (uint32_t)(efhi ^ MASK); float f; memcpy(&f, &u, 4); return f; }
+    void setI(int64_t a, int64_t b) { elo = (uint64_t)a ^ MASK; ehi = (uint64_t)b ^ MASK; }
+    void setF(float a, float b) {
+        uint32_t ua, ub; memcpy(&ua, &a, 4); memcpy(&ub, &b, 4);
+        eflo = (uint64_t)ua ^ MASK; efhi = (uint64_t)ub ^ MASK;
+    }
     std::string text;         // string search
     size_t size() const {
         if (type == QWORD) return 8;
@@ -97,11 +112,9 @@ inline Needle makeNeedle(int type, const std::string &raw) {
     std::string b = tilde == std::string::npos ? s : s.substr(tilde + 1);
     n.range = tilde != std::string::npos;
     if (type == FLOAT) {
-        n.flo = (float)strtod(a.c_str(), nullptr);
-        n.fhi = (float)strtod(b.c_str(), nullptr);
+        n.setF((float)strtod(a.c_str(), nullptr), (float)strtod(b.c_str(), nullptr));
     } else {
-        n.lo = strtoll(a.c_str(), nullptr, 10);
-        n.hi = strtoll(b.c_str(), nullptr, 10);
+        n.setI(strtoll(a.c_str(), nullptr, 10), strtoll(b.c_str(), nullptr, 10));
     }
     return n;
 }
@@ -110,16 +123,16 @@ inline bool matchAt(const Needle &n, const uint8_t *p) {
     switch (n.type) {
     case DWORD: {
         int32_t v; memcpy(&v, p, 4);
-        return n.range ? (v >= n.lo && v <= n.hi) : v == (int32_t)n.lo;
+        return n.range ? (v >= n.lo() && v <= n.hi()) : v == (int32_t)n.lo();
     }
     case QWORD: {
         int64_t v; memcpy(&v, p, 8);
-        return n.range ? (v >= n.lo && v <= n.hi) : v == n.lo;
+        return n.range ? (v >= n.lo() && v <= n.hi()) : v == n.lo();
     }
     case FLOAT: {
         float v; memcpy(&v, p, 4);
         if (std::isnan(v)) return false;
-        return n.range ? (v >= n.flo && v <= n.fhi) : v == n.flo;
+        return n.range ? (v >= n.flo() && v <= n.fhi()) : v == n.flo();
     }
     default: return memcmp(p, n.text.data(), n.text.size()) == 0;
     }
@@ -130,6 +143,7 @@ class Engine {
 public:
     std::atomic<bool> busy{false}, cancel{false};
     std::atomic<float> progress{0.f};
+    size_t statRegions = 0, statBytes = 0, statFails = 0; // last op diagnostics
 
     Engine() { fd_ = open("/proc/self/mem", O_RDWR | O_CLOEXEC); }
     ~Engine() { if (fd_ >= 0) close(fd_); }
@@ -160,12 +174,14 @@ public:
         if (fd_ < 0) { say("Cannot open /proc/self/mem (SELinux?)"); return; }
         if (f.flags == 1 || f.flags == 3) { say(std::string(f.name) + ": " + f.note); return; }
         if (f.flags == 2) { say(std::string(f.name) + ": original script does nothing here"); return; }
-        size_t total = 0, wrote = 0;
+        size_t total = 0, totalEdited = 0, regs = 0, bytes = 0, fails = 0;
         std::vector<Undo> undo;
         for (size_t i = 0; i < f.ops.size() && !cancel; i++) {
             progress = (float)i / (float)f.ops.size();
-            size_t n = runOp(f.ops[i], undo, &wrote);
-            total += n;
+            size_t edited = 0;
+            size_t n = runOp(f.ops[i], undo, edited);
+            total += n; totalEdited += edited;
+            regs += statRegions; bytes += statBytes; fails += statFails;
             if (n == 0 && f.flags == 4) { say(std::string(f.name) + ": no value found (not in a match?)"); break; }
         }
         {
@@ -174,8 +190,9 @@ public:
             slot.insert(slot.end(), undo.begin(), undo.end());
         }
         progress = 1.f;
-        char b[160];
-        snprintf(b, sizeof b, "%s: found %zu, edited %zu", f.name, total, wrote);
+        char b[220];
+        snprintf(b, sizeof b, "%s: found %zu, edited %zu  [%zu regions, %zu MB, %zu read errors]",
+                 f.name, total, totalEdited, regs, bytes >> 20, fails);
         say(b);
     }
 
@@ -188,7 +205,7 @@ public:
         }
         size_t n = 0;
         for (auto it = list.rbegin(); it != list.rend(); ++it)
-            if (pwrite(fd_, it->old.data(), it->old.size(), (off_t)it->addr) == (ssize_t)it->old.size()) n++;
+            if (GG_PWRITE(fd_, it->old.data(), it->old.size(), it->addr) == (ssize_t)it->old.size()) n++;
         char b[96];
         snprintf(b, sizeof b, "Reverted %zu value(s)", n);
         say(b);
@@ -231,21 +248,6 @@ public:
 private:
     int fd_ = -1;
     std::mutex mu_;
-    std::vector<uint8_t> scanbuf_;
-    std::vector<std::pair<uintptr_t, size_t>> self_; // our own heap objects (sorted): never treat as hits
-
-    void addSelf(const void *p, size_t n) { if (p && n) self_.push_back({(uintptr_t)p, n}); }
-    void addSelfStr(const std::string &s) { addSelf(s.data(), s.capacity() + 1); }
-    bool isSelf(uintptr_t a, size_t n) const {
-        auto it = std::upper_bound(self_.begin(), self_.end(), std::make_pair(a + n, (size_t)0),
-                                   [](const std::pair<uintptr_t, size_t> &x, const std::pair<uintptr_t, size_t> &y) { return x.first < y.first; });
-        while (it != self_.begin()) {
-            --it;
-            if (it->first + it->second <= a) { if (it->first + 65536 < a) break; continue; }
-            return true;
-        }
-        return false;
-    }
     std::vector<std::string> log_;
     std::vector<std::pair<int, std::vector<Undo>>> undo_;
 
@@ -260,29 +262,11 @@ private:
         if (log_.size() > 40) log_.erase(log_.begin());
     }
 
-    size_t runOp(const Op &op, std::vector<Undo> &undo, size_t *writtenOut = nullptr) {
+    size_t runOp(const Op &op, std::vector<Undo> &undo, size_t &written) {
+        statRegions = statBytes = statFails = 0;
         std::vector<std::string> sv = split(op.search, ';');
         std::vector<Needle> needles;
         for (auto &s : sv) needles.push_back(makeNeedle(op.type, s));
-        std::vector<std::string> ev = split(op.edit, ';');
-        {   // register everything we own that contains the values being searched
-            self_.clear();
-            const size_t CH = 1 << 20;
-            size_t maxLen = 1;
-            for (auto &n : needles) maxLen = std::max(maxLen, n.size());
-            scanbuf_.assign(CH + maxLen, 0);
-            addSelf(scanbuf_.data(), scanbuf_.size());
-            addSelf(sv.data(), sv.capacity() * sizeof(std::string));
-            addSelf(ev.data(), ev.capacity() * sizeof(std::string));
-            addSelf(needles.data(), needles.capacity() * sizeof(Needle));
-            for (auto &x : sv) addSelfStr(x);
-            for (auto &x : ev) addSelfStr(x);
-            for (auto &n : needles) addSelfStr(n.text);
-            for (auto &u : undo) addSelf(u.old.data(), u.old.capacity());
-            std::lock_guard<std::mutex> g(mu_);
-            for (auto &slot : undo_) for (auto &u : slot.second) addSelf(u.old.data(), u.old.capacity());
-            std::sort(self_.begin(), self_.end());
-        }
         bool group = needles.size() > 1;
         size_t limit = op.maxResults > 0 ? (size_t)op.maxResults : 0;
 
@@ -293,20 +277,21 @@ private:
             if (cancel) break;
             done++;
             if (!inRegion(m, op.region)) continue;
+            if (sizeof(void *) == 4 && m.start >= 0xFFFF0000u) continue; // [vectors]
+            statRegions++;
             scanRegion(m, needles, hits, group ? (size_t)2000000 : limit);
             if (!group && limit && hits.size() >= limit) break;
         }
         if (group) hits = groupFilter(hits, needles.size());
         if (limit && hits.size() > limit) hits.resize(limit);
 
-        size_t written = 0;
+        std::vector<std::string> ev = split(op.edit, ';');
+        written = 0;
         for (auto &h : hits) {
             if (ev.empty() || ev[0].empty()) break; // search-only
             const std::string &val = ev.size() == needles.size() ? ev[h.idx] : ev[0];
             if (writeValue(op.editType, val, h.addr, undo)) written++;
         }
-        scanbuf_.clear(); scanbuf_.shrink_to_fit();
-        if (writtenOut) *writtenOut += written;
         return hits.size();
     }
 
@@ -315,11 +300,12 @@ private:
         size_t maxLen = 0, align = 1;
         for (auto &n : needles) maxLen = std::max(maxLen, n.size());
         if (needles[0].type != BYTE) align = needles[0].size();
-        std::vector<uint8_t> &buf = scanbuf_;
+        std::vector<uint8_t> buf(CH + maxLen);
         for (uintptr_t a = m.start; a < m.end && !cancel; a += CH) {
             size_t want = std::min<uintptr_t>(CH + maxLen - 1, m.end - a);
-            ssize_t got = pread(fd_, buf.data(), want, (off_t)a);
-            if (got < (ssize_t)maxLen) continue;
+            ssize_t got = GG_PREAD(fd_, buf.data(), want, a);
+            if (got < (ssize_t)maxLen) { statFails++; continue; }
+            statBytes += (size_t)got;
             size_t last = (size_t)got - maxLen;
             size_t lim = std::min<size_t>(last, CH - 1); // positions owned by this chunk
             for (size_t o = 0; o <= lim; o++) {
@@ -327,7 +313,6 @@ private:
                 for (size_t k = 0; k < needles.size(); k++) {
                     const Needle &n = needles[k];
                     if (o + n.size() <= (size_t)got && matchAt(n, buf.data() + o)) {
-                        if (isSelf(a + o, n.size())) break; // our own copy, not game memory
                         hits.push_back({a + o, (int)k});
                         if (cap && hits.size() >= cap) return;
                         break;
@@ -372,8 +357,8 @@ private:
             memcpy(b, &v, 4); len = 4;
         }
         Undo u; u.addr = addr; u.old.resize(len);
-        if (pread(fd_, u.old.data(), len, (off_t)addr) != (ssize_t)len) return false;
-        if (pwrite(fd_, b, len, (off_t)addr) != (ssize_t)len) return false;
+        if (GG_PREAD(fd_, u.old.data(), len, addr) != (ssize_t)len) return false;
+        if (GG_PWRITE(fd_, b, len, addr) != (ssize_t)len) return false;
         undo.push_back(std::move(u));
         return true;
     }
