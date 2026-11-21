@@ -15,16 +15,57 @@
 #include <vector>
 #include <algorithm>
 #include <cerrno>
+#include <csetjmp>
+#include <csignal>
+#include <sys/mman.h>
 
 // IMPORTANT: on armeabi-v7a/x86 off_t is 32-bit, so addresses above 0x7FFFFFFF turned negative and
 // every pread() failed ("found 0"). Always use the 64-bit variants with a zero-extended address.
 #define GG_PREAD(fd, buf, n, addr)  pread64((fd), (buf), (n), (off64_t)(uint64_t)(uintptr_t)(addr))
 #define GG_PWRITE(fd, buf, n, addr) pwrite64((fd), (buf), (n), (off64_t)(uint64_t)(uintptr_t)(addr))
 
+// ---------------------------------------------------------------- direct memory access with fault guard
+// /proc/self/mem is refused on some devices (errno 13), so we also read/write our own address space
+// directly. A SIGSEGV/SIGBUS inside the guarded copy is turned into a normal "failed" result.
+namespace detail {
+inline thread_local sigjmp_buf *tl_jb = nullptr;
+inline struct sigaction g_oldSegv, g_oldBus;
+inline void guardHandler(int sig, siginfo_t *si, void *ctx) {
+    if (tl_jb) siglongjmp(*tl_jb, 1);
+    struct sigaction *old = sig == SIGSEGV ? &g_oldSegv : &g_oldBus;
+    if (old->sa_flags & SA_SIGINFO) { if (old->sa_sigaction) old->sa_sigaction(sig, si, ctx); return; }
+    if (old->sa_handler == SIG_DFL || old->sa_handler == SIG_IGN) { signal(sig, SIG_DFL); return; }
+    old->sa_handler(sig);
+}
+inline void ensureGuard() { // re-installs if the game replaced our handler; chains to whatever was there
+    for (int sig : {SIGSEGV, SIGBUS}) {
+        struct sigaction cur;
+        sigaction(sig, nullptr, &cur);
+        if ((cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction == guardHandler) continue;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = guardHandler;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigemptyset(&sa.sa_mask);
+        sigaction(sig, &sa, sig == SIGSEGV ? &g_oldSegv : &g_oldBus);
+    }
+}
+inline bool safeCopy(void *dst, const void *src, size_t n) {
+    ensureGuard();
+    sigjmp_buf jb;
+    tl_jb = &jb;
+    volatile bool ok = true;
+    if (sigsetjmp(jb, 1) == 0) memcpy(dst, src, n);
+    else ok = false;
+    tl_jb = nullptr;
+    return ok;
+}
+} // namespace detail
+
 namespace gg {
 
 enum Type : int { DWORD = 0, QWORD = 1, FLOAT = 2, BYTE = 3 };            // BYTE with ':' prefix = text
-enum Region : unsigned { ALLOC = 1, DATA = 2, CODE_APP = 4, ANY_RW = 8 }; // ANY_RW is for host testing only
+enum Region : unsigned { ALLOC = 1, DATA = 2, CODE_APP = 4, ANY_RW = 8, ANY_R = 16 }; // ANY_* are for host testing only
 
 struct Op {
     unsigned region;
@@ -173,7 +214,7 @@ public:
 
     // ------------------------------------------------ synchronous (also used by tests)
     void run(const Feature &f) {
-        if (fd_ < 0) { say("Cannot open /proc/self/mem (SELinux?)"); return; }
+        if (fd_ < 0) noProc_ = true;
         if (f.flags == 1 || f.flags == 3) { say(std::string(f.name) + ": " + f.note); return; }
         if (f.flags == 2) { say(std::string(f.name) + ": original script does nothing here"); return; }
         firstErrno = 0;
@@ -205,9 +246,9 @@ public:
             slot.insert(slot.end(), undo.begin(), undo.end());
         }
         progress = 1.f;
-        char b[220];
-        snprintf(b, sizeof b, "%s: found %zu, edited %zu  [%zu regions, %zu MB, %zu read errors, errno=%d]",
-                 f.name, total, totalEdited, regs, bytes >> 20, fails, firstErrno);
+        char b[240];
+        snprintf(b, sizeof b, "%s: found %zu, edited %zu  [%zu regions, %zu MB, %zu read errors, errno=%d, %s]",
+                 f.name, total, totalEdited, regs, bytes >> 20, fails, firstErrno, directMode() ? "direct" : "proc");
         say(b);
     }
 
@@ -220,7 +261,7 @@ public:
         }
         size_t n = 0;
         for (auto it = list.rbegin(); it != list.rend(); ++it)
-            if (GG_PWRITE(fd_, it->old.data(), it->old.size(), it->addr) == (ssize_t)it->old.size()) n++;
+            if (wrMem(it->addr, it->old.data(), it->old.size())) n++;
         char b[96];
         snprintf(b, sizeof b, "Reverted %zu value(s)", n);
         say(b);
@@ -251,6 +292,7 @@ public:
         const std::string &p = m.path;
         auto has = [&](const char *s) { return p.find(s) != std::string::npos; };
         if (mask & ANY_RW) { if (m.w) return true; }
+        if (mask & ANY_R) return true;
         if (mask & ALLOC)
             if (m.w && (has("libc_malloc") || has("scudo") || has("[heap]") || has("jemalloc"))) return true;
         if (mask & DATA)
@@ -261,6 +303,47 @@ public:
     }
 
 private:
+    bool noProc_ = false;   // /proc/self/mem refused -> use direct access
+public:
+    bool forceDirect = false;
+    bool directMode() const { return noProc_ || forceDirect; }
+private:
+    bool rdMem(uintptr_t addr, void *dst, size_t n) {
+        if (!directMode()) {
+            ssize_t r = GG_PREAD(fd_, dst, n, addr);
+            if (r == (ssize_t)n) return true;
+            if (r < 0 && (errno == EACCES || errno == EPERM || errno == ENOSYS)) noProc_ = true;
+            else return false;
+        }
+        return detail::safeCopy(dst, (const void *)addr, n);
+    }
+    static int protOf(uintptr_t addr) {
+        for (auto &m : readMaps())
+            if (addr >= m.start && addr < m.end)
+                return (m.r ? PROT_READ : 0) | (m.w ? PROT_WRITE : 0) | (m.x ? PROT_EXEC : 0);
+        return -1;
+    }
+    bool wrMem(uintptr_t addr, const void *src, size_t n) {
+        if (!directMode()) {
+            ssize_t r = GG_PWRITE(fd_, src, n, addr);
+            if (r == (ssize_t)n) {                         // verify it really landed, else fall back
+                uint8_t chk[256];
+                if (n <= sizeof chk && detail::safeCopy(chk, (const void *)addr, n) && memcmp(chk, src, n) == 0) return true;
+            } else if (r < 0 && (errno == EACCES || errno == EPERM || errno == ENOSYS)) noProc_ = true;
+            else if (r < 0) return false;
+        }
+        bool ok = detail::safeCopy((void *)addr, src, n);   // writable page: done
+        if (!ok) {                                           // read-only page: unprotect, write, restore
+            int old = protOf(addr);
+            if (old < 0) return false;
+            uintptr_t pg = addr & ~(uintptr_t)4095, end = (addr + n + 4095) & ~(uintptr_t)4095;
+            if (mprotect((void *)pg, end - pg, PROT_READ | PROT_WRITE | (old & PROT_EXEC)) != 0) return false;
+            ok = detail::safeCopy((void *)addr, src, n);
+            mprotect((void *)pg, end - pg, old);
+        }
+        __builtin___clear_cache((char *)addr, (char *)addr + n);
+        return ok;
+    }
     int fd_ = -1;
     std::mutex mu_;
     std::vector<std::string> log_;
@@ -311,14 +394,14 @@ private:
     }
 
     void scanRegion(const MapEntry &m, const std::vector<Needle> &needles, std::vector<Hit> &hits, size_t cap) {
-        const size_t CH = 1 << 20;
+        const size_t CH = 256 << 10;
         size_t maxLen = 0, align = 1;
         for (auto &n : needles) maxLen = std::max(maxLen, n.size());
         if (needles[0].type != BYTE) align = needles[0].size();
         std::vector<uint8_t> buf(CH + maxLen);
         for (uintptr_t a = m.start; a < m.end && !cancel; a += CH) {
             size_t want = std::min<uintptr_t>(CH + maxLen - 1, m.end - a);
-            ssize_t got = GG_PREAD(fd_, buf.data(), want, a);
+            ssize_t got = rdMem(a, buf.data(), want) ? (ssize_t)want : -1;
             if (got < (ssize_t)maxLen) { if (!statFails) firstErrno = errno; statFails++; continue; }
             statBytes += (size_t)got;
             size_t last = (size_t)got - maxLen;
@@ -372,8 +455,8 @@ private:
             memcpy(b, &v, 4); len = 4;
         }
         Undo u; u.addr = addr; u.old.resize(len);
-        if (GG_PREAD(fd_, u.old.data(), len, addr) != (ssize_t)len) return false;
-        if (GG_PWRITE(fd_, b, len, addr) != (ssize_t)len) return false;
+        if (!rdMem(addr, u.old.data(), len)) return false;
+        if (!wrMem(addr, b, len)) return false;
         undo.push_back(std::move(u));
         return true;
     }
