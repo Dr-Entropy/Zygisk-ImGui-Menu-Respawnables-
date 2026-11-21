@@ -10,15 +10,16 @@ using zygisk::ServerSpecializeArgs;
 class MyModule : public zygisk::ModuleBase {
 public:
     void onLoad(Api *api, JNIEnv *env) override {
+        api_ = api;
         env_ = env;
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
-        if (!args || !args->nice_name) {
-            LOGE("Skip unknown process");
-            return;
-        }
-        enable_hack = isGame(env_, args->app_data_dir);
+        enable_hack = false;
+        if (args && args->nice_name && args->app_data_dir)
+            enable_hack = isGame(env_, args->app_data_dir);
+        // Any other app (browser, etc.): unload this library so it stays out of those processes entirely
+        if (!enable_hack) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
@@ -32,6 +33,7 @@ public:
     }
 
 private:
+    Api *api_{};
     JNIEnv *env_{};
 };
 

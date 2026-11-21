@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <vector>
 #include <algorithm>
+#include <cerrno>
 
 // IMPORTANT: on armeabi-v7a/x86 off_t is 32-bit, so addresses above 0x7FFFFFFF turned negative and
 // every pread() failed ("found 0"). Always use the 64-bit variants with a zero-extended address.
@@ -144,6 +145,7 @@ public:
     std::atomic<bool> busy{false}, cancel{false};
     std::atomic<float> progress{0.f};
     size_t statRegions = 0, statBytes = 0, statFails = 0; // last op diagnostics
+    int firstErrno = 0;
 
     Engine() { fd_ = open("/proc/self/mem", O_RDWR | O_CLOEXEC); }
     ~Engine() { if (fd_ >= 0) close(fd_); }
@@ -174,6 +176,19 @@ public:
         if (fd_ < 0) { say("Cannot open /proc/self/mem (SELinux?)"); return; }
         if (f.flags == 1 || f.flags == 3) { say(std::string(f.name) + ": " + f.note); return; }
         if (f.flags == 2) { say(std::string(f.name) + ": original script does nothing here"); return; }
+        firstErrno = 0;
+        {
+            size_t cA = 0, cD = 0, cC = 0, all = 0;
+            for (auto &m : readMaps()) {
+                all++;
+                if (inRegion(m, ALLOC)) cA++;
+                if (inRegion(m, DATA)) cD++;
+                if (inRegion(m, CODE_APP)) cC++;
+            }
+            char d[160];
+            snprintf(d, sizeof d, "maps: total=%zu alloc=%zu data=%zu code=%zu ptr=%d-bit", all, cA, cD, cC, (int)sizeof(void *) * 8);
+            say(d);
+        }
         size_t total = 0, totalEdited = 0, regs = 0, bytes = 0, fails = 0;
         std::vector<Undo> undo;
         for (size_t i = 0; i < f.ops.size() && !cancel; i++) {
@@ -191,8 +206,8 @@ public:
         }
         progress = 1.f;
         char b[220];
-        snprintf(b, sizeof b, "%s: found %zu, edited %zu  [%zu regions, %zu MB, %zu read errors]",
-                 f.name, total, totalEdited, regs, bytes >> 20, fails);
+        snprintf(b, sizeof b, "%s: found %zu, edited %zu  [%zu regions, %zu MB, %zu read errors, errno=%d]",
+                 f.name, total, totalEdited, regs, bytes >> 20, fails, firstErrno);
         say(b);
     }
 
@@ -304,7 +319,7 @@ private:
         for (uintptr_t a = m.start; a < m.end && !cancel; a += CH) {
             size_t want = std::min<uintptr_t>(CH + maxLen - 1, m.end - a);
             ssize_t got = GG_PREAD(fd_, buf.data(), want, a);
-            if (got < (ssize_t)maxLen) { statFails++; continue; }
+            if (got < (ssize_t)maxLen) { if (!statFails) firstErrno = errno; statFails++; continue; }
             statBytes += (size_t)got;
             size_t last = (size_t)got - maxLen;
             size_t lim = std::min<size_t>(last, CH - 1); // positions owned by this chunk
