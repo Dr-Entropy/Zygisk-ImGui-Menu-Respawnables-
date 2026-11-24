@@ -1,4 +1,4 @@
-// menu.h - Respawnables menu (ImGui) driving the GG-style memory engine
+// menu.h - Bounty Rush 60 FPS menu (ImGui)
 #ifndef ZYGISK_MENU_TEMPLATE_MENU_H
 #define ZYGISK_MENU_TEMPLATE_MENU_H
 
@@ -12,7 +12,7 @@ static gg::Fps60 g_fps(g_engine);
 
 void DrawMenu()
 {
-    Begin(OBFUSCATE("Respawnables"));
+    Begin(OBFUSCATE("Bounty Rush 60 FPS"));
 
     TextUnformatted("FPS 60");
     TextDisabled("Status: %s", g_fps.enabled() ? "ON" : "OFF");
