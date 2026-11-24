@@ -3,46 +3,32 @@
 #define ZYGISK_MENU_TEMPLATE_MENU_H
 
 #include "gg_engine.h"
-#include "gg_features.h"
+#include "fps60.h"
 
 using namespace ImGui;
 
 static gg::Engine g_engine;
-static std::vector<gg::Feature> g_features = BuildFeatures();
-
-static const char *kTabs[] = {"Combat", "Spawns", "Time", "Shop", "XP"};
+static gg::Fps60 g_fps(g_engine);
 
 void DrawMenu()
 {
     Begin(OBFUSCATE("Respawnables"));
+
+    TextUnformatted("FPS 60");
+    TextDisabled("Status: %s", g_fps.enabled() ? "ON" : "OFF");
     if (g_engine.busy) {
-        ProgressBar(g_engine.progress, ImVec2(-1, 0), "Working...");
-        if (Button("Cancel")) g_engine.cancel = true;
-    }
-    if (BeginTabBar("Tabs", ImGuiTabBarFlags_FittingPolicyResizeDown)) {
-        for (const char *tab : kTabs) {
-            if (!BeginTabItem(tab)) continue;
-            for (auto &f : g_features) {
-                if (strcmp(f.category, tab) != 0) continue;
-                PushID(f.id);
-                TextUnformatted(f.name);
-                if (f.note[0]) TextDisabled("%s", f.note);
-                if (Button("Apply")) g_engine.runAsync(f);
-                if (g_engine.hasUndo(f.id)) {
-                    SameLine();
-                    if (Button("Undo")) g_engine.revertAsync(f.id);
-                }
-                Separator();
-                PopID();
-            }
-            EndTabItem();
+        TextUnformatted("Working...");
+    } else {
+        if (!g_fps.enabled()) {
+            if (Button("Enable")) g_fps.enableAsync();
+        } else {
+            if (Button("Disable")) g_fps.disableAsync();
         }
-        if (BeginTabItem("Log")) {
-            for (auto &l : g_engine.logLines()) TextWrapped("%s", l.c_str());
-            EndTabItem();
-        }
-        EndTabBar();
     }
+    Separator();
+    TextUnformatted("Log");
+    for (auto &l : g_engine.logLines()) TextWrapped("%s", l.c_str());
+
     End();
 }
 

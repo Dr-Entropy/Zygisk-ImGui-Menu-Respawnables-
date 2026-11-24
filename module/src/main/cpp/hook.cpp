@@ -32,7 +32,7 @@
 #include "Rect.h"
 #include <fstream>
 #include <limits>
-#define GamePackageName "respawn" // case-insensitive part of the game package name (check: pm list packages | grep -i respawn)
+#define GamePackageName "bandainamcoent.opbrww" // com.bandainamcoent.opbrww (One Piece Bounty Rush); case-insensitive part of the package name
 
 int glHeight, glWidth;
 

@@ -307,7 +307,7 @@ private:
 public:
     bool forceDirect = false;
     bool directMode() const { return noProc_ || forceDirect; }
-private:
+    void log(const std::string &s) { say(s); }
     bool rdMem(uintptr_t addr, void *dst, size_t n) {
         if (!directMode()) {
             ssize_t r = GG_PREAD(fd_, dst, n, addr);
@@ -317,12 +317,14 @@ private:
         }
         return detail::safeCopy(dst, (const void *)addr, n);
     }
+private:
     static int protOf(uintptr_t addr) {
         for (auto &m : readMaps())
             if (addr >= m.start && addr < m.end)
                 return (m.r ? PROT_READ : 0) | (m.w ? PROT_WRITE : 0) | (m.x ? PROT_EXEC : 0);
         return -1;
     }
+public:
     bool wrMem(uintptr_t addr, const void *src, size_t n) {
         if (!directMode()) {
             ssize_t r = GG_PWRITE(fd_, src, n, addr);
@@ -344,6 +346,7 @@ private:
         __builtin___clear_cache((char *)addr, (char *)addr + n);
         return ok;
     }
+private:
     int fd_ = -1;
     std::mutex mu_;
     std::vector<std::string> log_;
